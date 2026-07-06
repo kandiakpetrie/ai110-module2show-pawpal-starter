@@ -52,6 +52,61 @@ def test_task_is_recurring():
     assert daily.is_recurring() is True
 
 
+def test_next_occurrence_daily_advances_one_day():
+    """A DAILY task's next occurrence is one day later, reset to not-done."""
+    task = Task(
+        description="Feed Mochi",
+        frequency=Frequency.DAILY,
+        completed=True,
+        due_date=date(2026, 7, 5),
+        due_time=time(8, 0),
+    )
+
+    nxt = task.next_occurrence()
+
+    assert nxt is not None
+    assert nxt.due_date == date(2026, 7, 6)   # +1 day
+    assert nxt.due_time == time(8, 0)          # same time of day
+    assert nxt.completed is False              # fresh copy is not done
+    assert nxt is not task                      # a genuinely new instance
+
+
+def test_next_occurrence_weekly_advances_seven_days():
+    """A WEEKLY task's next occurrence is seven days later."""
+    task = Task(
+        description="Bath",
+        frequency=Frequency.WEEKLY,
+        completed=True,
+        due_date=date(2026, 7, 5),
+    )
+
+    nxt = task.next_occurrence()
+
+    assert nxt is not None
+    assert nxt.due_date == date(2026, 7, 12)  # +7 days
+    assert nxt.completed is False
+
+
+def test_next_occurrence_once_returns_none():
+    """One-time (and monthly) tasks don't produce a daily/weekly follow-up."""
+    once = Task(description="Vet visit", frequency=Frequency.ONCE)
+    monthly = Task(description="Flea med", frequency=Frequency.MONTHLY)
+
+    assert once.next_occurrence() is None
+    assert monthly.next_occurrence() is None
+
+
+def test_next_occurrence_without_date_stays_undated():
+    """A recurring task with no due date resets to not-done but stays undated."""
+    task = Task(description="Feed", frequency=Frequency.DAILY, completed=True)
+
+    nxt = task.next_occurrence()
+
+    assert nxt is not None
+    assert nxt.due_date is None
+    assert nxt.completed is False
+
+
 # --- Pet ------------------------------------------------------------------
 
 def test_task_addition():
@@ -151,3 +206,108 @@ def test_scheduler_organize_by_date():
     scheduler.add_task(sooner)
 
     assert scheduler.organize_by_date() == [sooner, later, undated]
+
+
+def test_scheduler_complete_task_queues_next_occurrence():
+    """Completing a DAILY task marks it done and adds tomorrow's copy."""
+    scheduler = Scheduler()
+    feeding = Task(
+        description="Feed Mochi",
+        frequency=Frequency.DAILY,
+        due_date=date(2026, 7, 5),
+        due_time=time(8, 0),
+    )
+    scheduler.add_task(feeding)
+
+    follow_up = scheduler.complete_task(feeding)
+
+    # Original is now done; a new pending copy exists for the next day.
+    assert feeding.completed is True
+    assert follow_up is not None
+    assert follow_up.due_date == date(2026, 7, 6)
+    assert follow_up.completed is False
+    assert len(scheduler.schedule) == 2               # original + follow-up
+    assert scheduler.pending_tasks() == [follow_up]   # only the new one is pending
+
+
+def test_scheduler_complete_task_once_queues_nothing():
+    """Completing a one-time task marks it done but queues no follow-up."""
+    scheduler = Scheduler()
+    vet = Task(description="Vet visit", frequency=Frequency.ONCE)
+    scheduler.add_task(vet)
+
+    follow_up = scheduler.complete_task(vet)
+
+    assert vet.completed is True
+    assert follow_up is None
+    assert len(scheduler.schedule) == 1  # nothing added
+
+
+def test_scheduler_detects_same_time_conflict():
+    """Two tasks at the same date+time are reported as one conflict group."""
+    scheduler = Scheduler()
+    when = dict(due_date=date(2026, 7, 5), due_time=time(8, 0))
+    feed = Task(description="Feed Buddy", **when)
+    med = Task(description="Med Mochi", **when)   # different pet, same moment
+    walk = Task(description="Walk", due_date=date(2026, 7, 5), due_time=time(17, 0))
+    scheduler.add_task(feed)
+    scheduler.add_task(med)
+    scheduler.add_task(walk)
+
+    conflicts = scheduler.find_conflicts()
+
+    assert scheduler.has_conflicts() is True
+    assert len(conflicts) == 1                    # one clashing moment
+    assert len(conflicts[0]) == 2                 # exactly two tasks clash
+    assert feed in conflicts[0] and med in conflicts[0]   # the two 08:00 tasks
+    assert walk not in conflicts[0]               # 17:00 task is clear
+
+
+def test_scheduler_no_conflict_when_times_differ():
+    """Tasks at different times (or unscheduled) produce no conflicts."""
+    scheduler = Scheduler()
+    scheduler.add_task(Task(description="A", due_date=date(2026, 7, 5), due_time=time(8, 0)))
+    scheduler.add_task(Task(description="B", due_date=date(2026, 7, 5), due_time=time(9, 0)))
+    scheduler.add_task(Task(description="Whenever"))  # no date/time -> can't clash
+
+    assert scheduler.find_conflicts() == []
+    assert scheduler.has_conflicts() is False
+
+
+def test_conflict_warning_returns_message_on_clash():
+    """conflict_warning() returns a non-empty, informative string on a clash."""
+    scheduler = Scheduler()
+    when = dict(due_date=date(2026, 7, 5), due_time=time(8, 0))
+    scheduler.add_task(Task(description="Feed Buddy", **when))
+    scheduler.add_task(Task(description="Med Mochi", **when))
+
+    warning = scheduler.conflict_warning()
+
+    assert warning != ""              # truthy -> there is a warning
+    assert "08:00" in warning         # names the clashing time
+    assert "Feed Buddy" in warning
+    assert "Med Mochi" in warning
+
+
+def test_conflict_warning_empty_when_clear():
+    """conflict_warning() returns '' (falsy) when there are no conflicts."""
+    scheduler = Scheduler()
+    scheduler.add_task(Task(description="A", due_date=date(2026, 7, 5), due_time=time(8, 0)))
+    scheduler.add_task(Task(description="B", due_date=date(2026, 7, 5), due_time=time(9, 0)))
+
+    assert scheduler.conflict_warning() == ""
+    assert not scheduler.conflict_warning()  # falsy, so `if warning:` skips it
+
+
+def test_scheduler_conflict_ignores_completed_and_other_dates():
+    """A completed task, or a same-time task on another day, isn't a conflict."""
+    scheduler = Scheduler()
+    t1 = Task(description="Active", due_date=date(2026, 7, 5), due_time=time(8, 0))
+    done = Task(description="Done", due_date=date(2026, 7, 5), due_time=time(8, 0),
+                completed=True)                                   # same moment but finished
+    other_day = Task(description="Tomorrow", due_date=date(2026, 7, 6), due_time=time(8, 0))
+    scheduler.add_task(t1)
+    scheduler.add_task(done)
+    scheduler.add_task(other_day)
+
+    assert scheduler.has_conflicts() is False
