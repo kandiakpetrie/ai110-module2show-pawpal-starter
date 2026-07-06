@@ -85,6 +85,13 @@ if "pet" not in st.session_state:
 owner = st.session_state.owner
 pet = st.session_state.pet
 
+# The Scheduler is the "brain" that organizes and manages tasks. Keep ONE in
+# the vault so the same instance handles both completing tasks (recurring
+# roll-forward) and generating the schedule below.
+if "scheduler" not in st.session_state:
+    st.session_state.scheduler = Scheduler()
+scheduler = st.session_state.scheduler
+
 # Update the attributes whenever the user changes the inputs. Because the
 # script reruns top-to-bottom, assigning every run keeps them in sync while
 # preserving everything else attached to the object (pets, tasks, etc.).
@@ -159,7 +166,7 @@ visible_tasks = owner.filter_tasks(
 )
 
 if visible_tasks:
-    st.write(f"Showing {len(visible_tasks)} {status_filter} task(s) for {pet.name}:")
+    st.success(f"Showing {len(visible_tasks)} {status_filter} task(s) for {pet.name}.")
     # Keys use id(t), a stable per-object id, instead of the loop index — so
     # filtering or removing a task can't bind a widget to the wrong task.
     for t in visible_tasks:
@@ -170,10 +177,10 @@ if visible_tasks:
                 label_visibility="collapsed",
             )
             if checked and not t.completed:
-                t.mark_complete()
-                # Recurring roll-forward: a completed daily/weekly task spawns a
-                # fresh copy for its next date via Task.next_occurrence().
-                follow_up = t.next_occurrence()
+                # Delegate to the Scheduler: complete_task() marks the task done
+                # and, for daily/weekly tasks, returns a fresh copy for the next
+                # date. Attach that copy to the pet so it shows up in the list.
+                follow_up = scheduler.complete_task(t)
                 if follow_up is not None:
                     pet.add_task(follow_up)
                 st.rerun()
@@ -208,7 +215,8 @@ order_by = st.radio(
 )
 
 if st.button("Generate schedule"):
-    scheduler = Scheduler()
+    # Reuse the vault's Scheduler; build_schedule() refreshes it from every
+    # task currently attached to the owner's pets.
     scheduler.build_schedule(owner)  # pulls every task from all of the owner's pets
 
     # Each option maps to a different Scheduler sorting algorithm.
@@ -220,15 +228,37 @@ if st.button("Generate schedule"):
         ordered = scheduler.sort_by_time()            # time of day only
 
     if ordered:
-        st.write(f"Schedule for {owner.name} — {scheduler.total_time()} min of pending work:")
+        # Summary metrics give the plan a professional, dashboard-like header.
+        pending_count = len(scheduler.pending_tasks())
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Tasks", len(ordered))
+        m2.metric("Pending", pending_count)
+        m3.metric("Pending time", f"{scheduler.total_time()} min")
+
+        st.caption(f"Schedule for {owner.name}, ordered by {order_by}.")
+
+        # Render the sorted schedule as a clean table instead of a raw list.
+        rows = []
         for i, task in enumerate(ordered, start=1):
-            st.write(f"{i}. {task}")
+            rows.append(
+                {
+                    "#": i,
+                    "Status": "✓ Done" if task.completed else "○ Pending",
+                    "Task": f"{'🔁 ' if task.is_recurring() else ''}{task.description}",
+                    "Priority": task.priority_level.name.capitalize(),
+                    "Duration": f"{task.duration} min",
+                    "Frequency": task.frequency.name.capitalize(),
+                    "Due date": task.due_date.strftime("%b %d, %Y") if task.due_date else "—",
+                    "Time": task.due_time.strftime("%H:%M") if task.due_time else "—",
+                }
+            )
+        st.table(rows)
 
         # Explain the plan: which task to do first and why.
         next_task = scheduler.next_task()
         if next_task:
             st.success(
-                f"Do this first: {next_task.description} "
+                f"✅ Do this first: **{next_task.description}** "
                 f"({next_task.priority_level.name.lower()} priority)"
             )
 
