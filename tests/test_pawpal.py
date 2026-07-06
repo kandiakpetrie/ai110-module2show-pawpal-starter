@@ -311,3 +311,200 @@ def test_scheduler_conflict_ignores_completed_and_other_dates():
     scheduler.add_task(other_day)
 
     assert scheduler.has_conflicts() is False
+
+
+# --- next_occurrence: boundary + independence -----------------------------
+
+def test_next_occurrence_daily_crosses_year_boundary():
+    """A DAILY task due Dec 31 rolls forward to Jan 1 of the next year."""
+    task = Task(
+        description="Feed",
+        frequency=Frequency.DAILY,
+        completed=True,
+        due_date=date(2026, 12, 31),
+        due_time=time(8, 0),
+    )
+
+    nxt = task.next_occurrence()
+
+    assert nxt.due_date == date(2027, 1, 1)   # month AND year advance
+
+
+def test_next_occurrence_weekly_crosses_month_boundary():
+    """A WEEKLY task near month end rolls into the following month."""
+    task = Task(
+        description="Bath",
+        frequency=Frequency.WEEKLY,
+        due_date=date(2026, 7, 28),
+    )
+
+    nxt = task.next_occurrence()
+
+    assert nxt.due_date == date(2026, 8, 4)   # +7 days spills into August
+
+
+def test_next_occurrence_copy_is_independent_of_original():
+    """Mutating the rolled-forward copy must not touch the original task."""
+    original = Task(
+        description="Feed Mochi",
+        frequency=Frequency.DAILY,
+        completed=True,
+        due_date=date(2026, 7, 5),
+    )
+
+    nxt = original.next_occurrence()
+    nxt.description = "Changed"
+    nxt.mark_complete()
+
+    # The original is a genuinely separate object (dataclasses.replace),
+    # so editing the copy leaves it untouched.
+    assert original.description == "Feed Mochi"
+    assert original.completed is True          # original stays done (history)
+    assert original.due_date == date(2026, 7, 5)
+
+
+def test_monthly_is_recurring_but_never_rolls_forward():
+    """Documents a known quirk: MONTHLY reads as recurring yet never repeats.
+
+    is_recurring() returns True for MONTHLY (so the UI shows the 🔁 badge),
+    but next_occurrence() only advances DAILY/WEEKLY, so a completed monthly
+    task silently produces no follow-up. Pinning this so the behavior is a
+    deliberate choice rather than a latent surprise.
+    """
+    monthly = Task(description="Flea med", frequency=Frequency.MONTHLY,
+                   due_date=date(2026, 7, 5))
+
+    assert monthly.is_recurring() is True       # shown as recurring...
+    assert monthly.next_occurrence() is None    # ...but never spawns a copy
+
+
+# --- sort_by_time ---------------------------------------------------------
+
+def test_sort_by_time_orders_by_time_of_day_ignoring_date():
+    """sort_by_time() sorts on time-of-day only; the due date is irrelevant."""
+    scheduler = Scheduler()
+    # Deliberately give the EARLIEST time-of-day the LATEST date, so a
+    # date-aware sort would order these differently than a time-only sort.
+    morning = Task(description="Morning", due_date=date(2026, 7, 10), due_time=time(7, 0))
+    noon = Task(description="Noon", due_date=date(2026, 7, 5), due_time=time(12, 0))
+    evening = Task(description="Evening", due_date=date(2026, 7, 6), due_time=time(18, 0))
+    scheduler.add_task(evening)
+    scheduler.add_task(morning)
+    scheduler.add_task(noon)
+
+    assert scheduler.sort_by_time() == [morning, noon, evening]
+
+
+def test_sort_by_time_pushes_untimed_tasks_last():
+    """Tasks with no due_time sort after every timed task (no crash on None)."""
+    scheduler = Scheduler()
+    timed = Task(description="Timed", due_time=time(9, 0))
+    untimed = Task(description="Untimed")   # due_time is None
+    scheduler.add_task(untimed)
+    scheduler.add_task(timed)
+
+    assert scheduler.sort_by_time() == [timed, untimed]
+
+
+def test_sort_by_time_treats_midnight_as_earliest_not_missing():
+    """A midnight (00:00) task must sort first, not be mistaken for 'no time'.
+
+    Guards the `task.due_time or time.max` idiom: time(0,0) is truthy in
+    modern Python, so midnight stays an early time rather than collapsing to
+    the time.max sentinel used for untimed tasks.
+    """
+    scheduler = Scheduler()
+    midnight = Task(description="Midnight", due_time=time(0, 0))
+    morning = Task(description="Morning", due_time=time(8, 0))
+    untimed = Task(description="Untimed")
+    scheduler.add_task(untimed)
+    scheduler.add_task(morning)
+    scheduler.add_task(midnight)
+
+    assert scheduler.sort_by_time() == [midnight, morning, untimed]
+
+
+# --- organize_by_priority -------------------------------------------------
+
+def test_organize_by_priority_high_first_then_time_ascending():
+    """Sorts by priority (HIGH->LOW); within a tier, earlier times come first."""
+    scheduler = Scheduler()
+    high_late = Task(description="HighLate", priority_level=Priority.HIGH, due_time=time(12, 0))
+    high_early = Task(description="HighEarly", priority_level=Priority.HIGH, due_time=time(7, 30))
+    med = Task(description="Med", priority_level=Priority.MEDIUM, due_time=time(17, 0))
+    low_timed = Task(description="LowTimed", priority_level=Priority.LOW, due_time=time(9, 0))
+    low_untimed = Task(description="LowUntimed", priority_level=Priority.LOW)
+    for t in (med, low_untimed, high_late, low_timed, high_early):
+        scheduler.add_task(t)
+
+    assert scheduler.organize_by_priority() == [
+        high_early,   # HIGH 07:30
+        high_late,    # HIGH 12:00
+        med,          # MEDIUM 17:00
+        low_timed,    # LOW 09:00
+        low_untimed,  # LOW, no time -> last in its group
+    ]
+
+
+def test_organize_by_priority_is_stable_on_full_ties():
+    """Tasks with identical priority AND time keep their insertion order."""
+    scheduler = Scheduler()
+    first = Task(description="First", priority_level=Priority.HIGH, due_time=time(8, 0))
+    second = Task(description="Second", priority_level=Priority.HIGH, due_time=time(8, 0))
+    scheduler.add_task(first)
+    scheduler.add_task(second)
+
+    # sorted() is stable, so the tie resolves to the order they were added.
+    assert scheduler.organize_by_priority() == [first, second]
+
+
+# --- sorting: empty / all-None inputs -------------------------------------
+
+def test_sorts_handle_empty_schedule():
+    """Every sort returns an empty list on an empty schedule (no crash)."""
+    scheduler = Scheduler()
+
+    assert scheduler.organize_by_date() == []
+    assert scheduler.sort_by_time() == []
+    assert scheduler.organize_by_priority() == []
+
+
+def test_sorts_handle_all_untimed_tasks():
+    """With no dates/times set, sorts still succeed and keep every task."""
+    scheduler = Scheduler()
+    a = Task(description="A")
+    b = Task(description="B")
+    scheduler.add_task(a)
+    scheduler.add_task(b)
+
+    # None of the None-valued keys should raise; all tasks survive.
+    assert len(scheduler.organize_by_date()) == 2
+    assert len(scheduler.sort_by_time()) == 2
+    assert len(scheduler.organize_by_priority()) == 2
+
+
+# --- next_task / conflicts: remaining edges -------------------------------
+
+def test_next_task_returns_none_when_all_completed():
+    """next_task() is None once no pending task remains."""
+    scheduler = Scheduler()
+    scheduler.add_task(Task(description="Done1", completed=True))
+    scheduler.add_task(Task(description="Done2", completed=True))
+
+    assert scheduler.next_task() is None
+
+
+def test_conflict_groups_three_tasks_at_one_moment():
+    """Three tasks sharing a moment form a single group of three, not pairs."""
+    scheduler = Scheduler()
+    when = dict(due_date=date(2026, 7, 5), due_time=time(8, 0))
+    a = Task(description="A", **when)
+    b = Task(description="B", **when)
+    c = Task(description="C", **when)
+    for t in (a, b, c):
+        scheduler.add_task(t)
+
+    conflicts = scheduler.find_conflicts()
+
+    assert len(conflicts) == 1        # one clashing moment
+    assert len(conflicts[0]) == 3     # all three tasks, grouped together
